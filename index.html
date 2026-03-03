@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VAULT // Secure Notes</title>
+<link rel="stylesheet" href="style.css">
+<style>/*
+  
+   ************* QUESTINS *********
+  Q1: Why is client-side encryption weaker than server-side?
+ 
+ * Client-side encryption runs entirely in the browser, which means
+ * the encryption logic, key derivation method, and iteration count
+ * are visible through DevTools. The key is derived directly from the
+ * user's password in JavaScript. If the password is weak and an attacker
+ * gets access to the encrypted vault, they can attempt offline brute-force
+ * attacks without any server rate limiting.
+ 
+ * Another important weakness is XSS (Cross-Site Scripting). If malicious
+ * JavaScript is injected into the page, it can access decrypted notes
+ * while the vault is unlocked because the plaintext and CryptoKey exist
+ * in memory during the session. Encryption protects stored data, but it
+ * does not protect data while it is actively being used.
+ 
+ * In contrast, server-side encryption keeps key handling inside a
+ * controlled backend environment that users cannot inspect or modify.
+ 
+ * Q2: How can localStorage be tampered with?
+ 
+ * localStorage can be modified by anyone who has access to the browser.
+ * A user can open DevTools → Application → localStorage and manually
+ * edit or delete stored values. Browser extensions or injected scripts
+ * can also read or modify it.
+ 
+ * In this project, login attempts and lock metadata are stored outside
+ * the encrypted vault. If those values are deleted, the system treats
+ * missing attempts as MAX_ATTEMPTS to reduce simple bypass attempts.
+ 
+ * A SHA-256 checksum (metaHash) is also stored for metadata fields.
+ * On load, the checksum is recomputed and compared. If it does not match,
+ * the vault enters a locked state. This is basic tamper detection.
+ 
+ * Limitation: since this uses a normal hash (not HMAC), a determined
+ * attacker could recompute it. In production, integrity would be enforced
+ * server-side with a secret key.
+ 
+ * Q3: What would you change in production?
+ 
+ * - Move authentication and rate limiting to a backend server.
+ * - Store encrypted notes in a database instead of localStorage.
+ * - Use bcrypt or Argon2 for password hashing on the server.
+ * - Add two-factor authentication (TOTP or WebAuthn).
+ * - Enforce rate limits and logging server-side.
+ * - Use Content Security Policy headers to reduce XSS risk.
+ * - Manage encryption keys using a secure key management system.
+ 
+ * Q4: How would you make this multi-user?
+ 
+ * - Create a backend registration and login system.
+ * - Store a separate encrypted vault per user.
+ * - Use per-user salts for key derivation.
+ * - For shared notes, encrypt the note key using the recipient’s
+ *   public key (hybrid encryption).
+ * - Implement role-based access control for permissions.
+
+ ******************* ENCRYPTION STRATEGY *****************
+ 
+ * This vault uses AES-256-GCM through the Web Crypto API.
+ 
+ * I chose AES-GCM because it provides both confidentiality and
+ * integrity. If ciphertext is modified, decryption fails instead
+ * of returning corrupted data.
+ 
+ * The key is derived from the user’s password using PBKDF2
+ * (SHA-256, 200,000 iterations, random 16-byte salt).
+ * Each encryption operation uses a new 12-byte random IV.
+ 
+ * The derived key is never stored and must be recreated at login.
+ 
+ 
+ * HASH-CHAIN LOG (Tamper-Evident)
+ 
+ 
+ * Each log entry includes:
+ *   prevHash  → SHA-256 of previous entry
+ *   hash      → SHA-256 of this entry (including prevHash)
+ 
+ * This creates a simple hash chain. If any entry is modified,
+ * deleted, or reordered, the chain verification fails.
+ 
+ * This is inspired by append-only logging concepts, although
+ * it is implemented locally for demonstration purposes.
+ 
+
+
+ * CLIPBOARD WIPE TIMER (Note: browser may require premission)
+ * When note content is copied, a 30-second timer starts.
+ * After 30 seconds, the clipboard is overwritten with an empty string.
+ * This reduces the chance of sensitive data remaining in the clipboard.
+ 
+ * ANTI-BRUTE-FORCE LOGIC
+ * Attempt 1–2 : 1 second delay
+ * Attempt 3–5 : exponential delay (2^n seconds)
+ * Attempt 6+  : lockout with escalating duration
+ * Lock duration increases each time a hard lock occurs.
+ * Note: Because this is client-side only, a determined attacker
+ * could modify localStorage or alter the script. 
+ 
+ * METADATA CHECKSUM
+ * The metadata fields (salt, attempts, lockUntil, lockCount)
+ * are hashed using SHA-256 into a metaHash field.
+ * On load, the hash is recomputed and compared.
+ * If it does not match, the system assumes tampering and
+ * forces a lock state.
+ 
+ * PASSWORD STRENGTH FORMULA
+ * score =
+ *   min(length × 2, 20)
+ *   + lowercase bonus
+ *   + uppercase bonus
+ *   + digit bonus
+ *   + symbol bonus
+ *   + diversity bonus
+ *   - common pattern penalty
+ * Tiers:
+ *   0–20   → WEAK
+ *   21–50  → FAIR
+ *   51–70  → GOOD
+ *   71+    → STRONG
+
+ * EVENT LOG STRUCTURE
+ * {
+ *   id,
+ *   ts,
+ *   type,
+ *   scoreDelta,
+ *   prevHash,
+ *   hash
+ * }
+ * The first entry starts with prevHash = 64 zeros.
+ */</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- SETUP -->
+  <div id="screen-setup" class="screen active">
+    <div class="auth-box">
+      <div class="vault-logo">
+        <!-- <div class="logo-mark"></div> -->
+        <h1>Vault</h1>
+        <p>Secure Encrypted Notes</p>
+      </div>
+      <p style="font-size:10px;color:var(--muted);margin-bottom:24px;line-height:1.9;text-align:center;">
+        First launch. Create a master password to<br>initialize your AES-256-GCM encrypted vault.
+      </p>
+      <div class="form-group">
+        <label>Master Password</label>
+        <input type="password" id="setup-pw" placeholder="Create master password…" autocomplete="new-password">
+        <div class="strength-bar"><div class="strength-fill" id="strength-fill"></div></div>
+        <div class="strength-label" id="strength-label" style="color:var(--muted);">—</div>
+      </div>
+      <div class="form-group">
+        <label>Confirm Password</label>
+        <input type="password" id="setup-pw2" placeholder="Confirm password…" autocomplete="new-password">
+      </div>
+      <button class="btn-primary" id="btn-setup">Initialize Vault</button>
+      <div class="attempt-info" id="setup-msg"></div>
+    </div>
+  </div>
+
+  <!-- LOGIN -->
+  <div id="screen-login" class="screen">
+    <div class="auth-box">
+      <div class="vault-logo">
+        <!-- <div class="logo-mark"></div> -->
+        <h1>Vault</h1>
+        <p>Enter Master Password</p>
+      </div>
+      <div class="lockout-msg" id="lockout-msg">
+        ⚠ Vault Locked — Too many failed attempts<br>
+        <span id="lockout-countdown" style="font-family:var(--serif);font-style:italic;font-size:13px;"></span>
+      </div>
+      <div class="form-group">
+        <label>Master Password</label>
+        <input type="password" id="login-pw" placeholder="••••••••••••" autocomplete="current-password">
+      </div>
+      <button class="btn-primary" id="btn-login">Unlock Vault</button>
+      <div class="attempt-info" id="login-msg">
+        Attempts remaining: <span id="attempts-left">6</span>
+      </div>
+      <hr class="divider">
+      <div style="text-align:center;">
+        <button class="small-link" id="btn-reset-vault">Reset vault — wipes all data</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- VAULT -->
+  <div id="screen-vault" class="screen">
+    <header class="vault-header">
+      <div class="brand"><span class="brand-dot"></span>Vault</div>
+      <div class="header-right">
+        <div class="score-badge">Security Score &nbsp;<span class="score-val" id="score-display">0</span></div>
+        <button class="btn-logout" id="btn-logout">Log Out</button>
+      </div>
+    </header>
+    <div class="idle-bar"><div class="idle-fill" id="idle-fill"></div></div>
+    <div class="vault-body">
+      <aside class="sidebar">
+        <div class="sidebar-top">
+          <button class="btn-new-note" id="btn-new-note">+ New Note</button>
+        </div>
+        <div class="note-list" id="note-list"></div>
+        <div class="sidebar-footer"><span id="note-count">0 notes</span> · AES-256-GCM</div>
+      </aside>
+      <main class="note-editor">
+        <div class="empty-state" id="empty-state">
+          <div class="ei">📝</div>
+          <p>Select or create a note</p>
+        </div>
+        <div id="editor-form" style="display:none;flex-direction:column;gap:16px;flex:1;">
+          <div class="editor-toolbar">
+            <input type="text" class="editor-title" id="note-title" placeholder="Untitled note…">
+            <select class="expiry-select" id="note-expiry">
+              <option value="0">No expiry</option>
+              <option value="1">1 minute (demo)</option>
+              <option value="60">1 hour</option>
+              <option value="1440">24 hours</option>
+              <option value="10080">7 days</option>
+              <option value="43200">30 days</option>
+            </select>
+          </div>
+          <textarea class="note-body" id="note-body" placeholder="Begin writing your encrypted note…"></textarea>
+          <div class="editor-actions">
+            <span class="clipboard-hint" id="clipboard-hint"></span>
+            <button class="btn-del-note" id="btn-delete-note">Delete</button>
+            <button class="btn-save" id="btn-save-note">Encrypt + Save</button>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div class="score-delta" id="score-delta"></div>
+
+  <button class="log-toggle" id="log-toggle">Event Log <span id="chain-status"></span></button>
+
+  <div class="log-panel" id="log-panel">
+    <div class="log-header">
+      <span>Security Event Log</span>
+      <button class="small-link" id="log-close">Close</button>
+    </div>
+    <div class="log-entries" id="log-entries">
+      <div style="color:var(--muted);font-size:10px;padding:6px 0;">No events yet.</div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="modal">
+    <div class="modal-box">
+      <h3 id="modal-title">Confirm</h3>
+      <p id="modal-body">Are you sure?</p>
+      <div class="modal-actions">
+        <button class="btn-mc" id="modal-cancel">Cancel</button>
+        <button class="btn-mok" id="modal-confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+'use strict';
+
+const STORAGE_KEY  = 'vault_v2_blob';
+const MAX_ATTEMPTS = 6;
+const BASE_LOCKOUT = 10 * 60 * 1000;
+const IDLE_TIMEOUT = 5 * 60 * 1000;
+const PBKDF2_ITER  = 200_000;
+const CLIP_WIPE_MS = 30_000;
+
+const SCORE_EVENTS = {
+  STRONG_PASSWORD : +10,
+  WEAK_PASSWORD   : -10,
+  AUTH_FAIL       : -5,
+  SESSION_TIMEOUT : -8,
+  PROPER_LOGOUT   : +5
+};
+
+const LOG_STYLE = {
+  AUTH_SUCCESS:'success', NOTE_SAVED:'success', PROPER_LOGOUT:'success',
+  VAULT_CREATED:'info', NOTE_CREATED:'info', NOTE_DELETED:'info', STRONG_PASSWORD:'info',
+  AUTH_FAIL:'fail', LOCKOUT:'fail', NOTE_EXPIRED:'fail', TAMPER_DETECTED:'fail',
+  WEAK_PASSWORD:'warn', SESSION_TIMEOUT:'warn'
+};
+
+let sessionKey=null, vaultData=null, currentNoteId=null;
+let idleTimer=null, idleFillTimer=null, lockoutTimer=null, idleStart=null;
+let clipWipeInterval=null, clipWipeRemaining=0;
+
+const $  = id => document.getElementById(id);
+const b64e = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const b64d = s   => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+function uuid(){
+  return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>
+    (c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));
+}
+function nowISO(){ return new Date().toISOString(); }
+function fmtTs(iso){ return new Date(iso).toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+function fmtMs(ms){ const m=Math.floor(ms/60000),s=Math.floor((ms%60000)/1000); return `${m}m ${s}s`; }
+function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+
+let toastTimer;
+function showToast(msg, type='info'){
+  const t=$('toast'); t.textContent=msg; t.className=`toast ${type} show`;
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2800);
+}
+
+
+function showModal(title,body,onConfirm){
+  $('modal-title').textContent=title; $('modal-body').textContent=body;
+  $('modal').classList.add('open');
+  $('modal-confirm').onclick=()=>{ $('modal').classList.remove('open'); onConfirm(); };
+  $('modal-cancel').onclick=()=>$('modal').classList.remove('open');
+}
+
+function showScreen(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  $(id).classList.add('active');
+}
+
+async function deriveKey(password,saltBuf){
+  const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(password),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name:'PBKDF2',salt:saltBuf,iterations:PBKDF2_ITER,hash:'SHA-256'},
+    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function encryptVault(data,key){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(data)));
+  return {iv:b64e(iv),ct:b64e(ct)};
+}
+async function decryptVault(blob,key){
+  const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b64d(blob.iv)},key,b64d(blob.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+async function sha256hex(str){
+  const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(str));
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+
+function canonicalEntry(e){
+  return JSON.stringify({id:e.id,ts:e.ts,type:e.type,scoreΔ:e.scoreΔ,prevHash:e.prevHash});
+}
+async function buildLogEntry(type,scoreΔ){
+  const logs=vaultData?.logs??[];
+  const prev=logs[0];
+  const prevHash=prev?prev.hash:'0'.repeat(64);
+  const entry={id:uuid(),ts:nowISO(),type,scoreΔ,prevHash,hash:''};
+  entry.hash=await sha256hex(canonicalEntry(entry));
+  return entry;
+}
+async function verifyLogChain(logs){
+  if(!logs||logs.length===0) return true;
+  for(let i=0;i<logs.length;i++){
+    const e=logs[i];
+    if(e.hash!==await sha256hex(canonicalEntry(e))) return false;
+    if(i+1<logs.length && e.prevHash!==logs[i+1].hash) return false;
+  }
+  return true;
+}
+let chainValid=true;
+async function refreshChainStatus(){
+  chainValid=await verifyLogChain(vaultData?.logs??[]);
+  const el=$('chain-status');
+  if(el){ el.textContent=chainValid?'✓':'✗ TAMPERED'; el.className=chainValid?'chain-ok':'chain-bad'; }
+}
+
+
+function adjustScore(eventType){
+  const delta=SCORE_EVENTS[eventType]??0;
+  if(!vaultData||delta===0) return;
+  vaultData.score=(vaultData.score||0)+delta;
+  if($('score-display')) $('score-display').textContent=vaultData.score;
+  const el=$('score-delta');
+  el.textContent=(delta>0?'+':'')+delta;
+  el.style.color=delta>0?'var(--success)':'var(--danger)';
+  el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+}
+
+
+async function addLog(type,scoreΔ=0){
+  if(!vaultData) return;
+  if(!vaultData.logs) vaultData.logs=[];
+  const entry=await buildLogEntry(type,scoreΔ);
+  vaultData.logs.unshift(entry);
+  if(vaultData.logs.length>100) vaultData.logs.pop();
+  await refreshChainStatus();
+  renderLog();
+}
+function renderLog(){
+  const c=$('log-entries');
+  if(!vaultData?.logs?.length){ c.innerHTML='<div style="color:var(--muted);font-size:10px;padding:6px 0;">No events yet.</div>'; return; }
+  c.innerHTML=vaultData.logs.slice(0,40).map(e=>`
+    <div class="log-entry">
+      <span class="log-ts">${fmtTs(e.ts)}</span>
+      <span class="log-type ${LOG_STYLE[e.type]||'info'}">${e.type}</span>
+      <span class="log-score ${e.scoreΔ>0?'pos':e.scoreΔ<0?'neg':''}">${e.scoreΔ!==0?(e.scoreΔ>0?'+':'')+e.scoreΔ:''}</span>
+      <span class="log-chain">#${e.hash?e.hash.slice(0,8)+'…':'?'}</span>
+    </div>`).join('');
+}
+
+
+async function computeMetaHash(salt, attempts, lockUntil, lockCount){
+  const canonical = JSON.stringify({
+    salt: salt||'',
+    attempts: attempts??MAX_ATTEMPTS,
+    lockUntil: lockUntil||null,
+    lockCount: lockCount||0
+  });
+  return await sha256hex(canonical);
+}
+
+function loadBlob(){ try{ return JSON.parse(localStorage.getItem(STORAGE_KEY)); }catch{ return null; } }
+
+async function loadBlobVerified(){
+  const raw = loadBlob();
+  if(!raw) return null;
+
+  
+  if(raw.metaHash){
+    const expected = await computeMetaHash(raw.salt, raw.attempts, raw.lockUntil, raw.lockCount);
+    if(expected !== raw.metaHash){
+     
+      console.warn('[VAULT] Metadata checksum mismatch — possible tampering detected.');
+    
+      raw.attempts  = MAX_ATTEMPTS;
+
+      raw.lockUntil = Date.now() + BASE_LOCKOUT;   
+      raw.metaHash  = await computeMetaHash(raw.salt, raw.attempts, raw.lockUntil, raw.lockCount);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(raw));
+      
+      localStorage.setItem('vault_tamper_flag','1');
+    }
+  }
+  return raw;
+}
+
+async function saveVault(){
+  if(!sessionKey||!vaultData) return;
+  const {_salt,...payload}=vaultData;
+  const blob=await encryptVault(payload,sessionKey);
+  const raw=loadBlob()||{};
+  const attempts  = raw.attempts||0;
+  const lockUntil = raw.lockUntil||null;
+  const lockCount = raw.lockCount||0;
+  const metaHash  = await computeMetaHash(vaultData._salt, attempts, lockUntil, lockCount);
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    salt: vaultData._salt,
+    iv: blob.iv, ct: blob.ct,
+    attempts, lockUntil, lockCount,
+    metaHash   
+  }));
+}
+
+
+function scorePassword(pw){
+  if(!pw) return{score:0,tier:'EMPTY',color:'var(--muted)',pct:0};
+  let s=0;
+  s+=Math.min(pw.length*2,20);
+  if(/[a-z]/.test(pw)) s+=10;
+  if(/[A-Z]/.test(pw)) s+=10;
+  if(/[0-9]/.test(pw)) s+=10;
+  if(/[^a-zA-Z0-9]/.test(pw)) s+=15;
+  s+=Math.round((new Set(pw).size/pw.length)*10);
+  if(['123','abc','qwerty','password','pass','1234','letmein','admin','0000'].some(p=>pw.toLowerCase().includes(p))) s-=20;
+  s=Math.max(0,s);
+  for(const t of [{max:20,tier:'WEAK',color:'var(--danger)',pct:18},{max:50,tier:'FAIR',color:'var(--warn)',pct:50},{max:70,tier:'GOOD',color:'var(--info)',pct:75},{max:999,tier:'STRONG',color:'var(--success)',pct:100}])
+    if(s<=t.max) return{score:s,...t};
+}
+function updateStrengthUI(pw){
+  const r=scorePassword(pw);
+  const f=$('strength-fill'),l=$('strength-label');
+  if(!f) return;
+  f.style.width=r.pct+'%'; f.style.background=r.color;
+  l.textContent=pw?r.tier:'—'; l.style.color=r.color;
+}
+
+function getDelay(attempts){ if(attempts<=2)return 1000; if(attempts<=5)return Math.pow(2,attempts)*1000; return 0; }
+function isLocked(raw){ if(!raw?.lockUntil)return false; return Date.now()<raw.lockUntil; }
+function lockoutRemaining(raw){ return Math.max(0,(raw?.lockUntil||0)-Date.now()); }
+
+function resetIdleTimer(){
+  clearTimeout(idleTimer); idleStart=Date.now();
+  idleTimer=setTimeout(handleIdleTimeout,IDLE_TIMEOUT); updateIdleBar();
+}
+function updateIdleBar(){
+  clearInterval(idleFillTimer);
+  idleFillTimer=setInterval(()=>{
+    const pct=Math.max(0,100-((Date.now()-idleStart)/IDLE_TIMEOUT*100));
+    const f=$('idle-fill');
+    if(f){ f.style.width=pct+'%'; f.style.background=pct<20?'var(--danger)':pct<40?'var(--warn)':'linear-gradient(90deg,var(--navy-mid),var(--beige-dim))'; }
+    if(pct<=0) clearInterval(idleFillTimer);
+  },1000);
+}
+async function handleIdleTimeout(){
+  clearInterval(idleFillTimer);
+  
+  adjustScore('SESSION_TIMEOUT');
+  await addLog('SESSION_TIMEOUT',SCORE_EVENTS.SESSION_TIMEOUT);
+  await saveVault(); endSession();
+  showScreen('screen-login'); showToast('Session timed out auto logged out','warn'); updateLoginUI();
+}
+function endSession(){
+  sessionKey=null; vaultData=null; currentNoteId=null;
+  clearTimeout(idleTimer); clearInterval(idleFillTimer); clearInterval(lockoutTimer); clearClipboardWipe();
+}
+
+
+function startClipboardWipeTimer(){
+  clearClipboardWipe(); clipWipeRemaining=CLIP_WIPE_MS/1000; updateClipHint();
+  clipWipeInterval=setInterval(()=>{
+    clipWipeRemaining--;
+    updateClipHint();
+    if(clipWipeRemaining<=0){
+      clearClipboardWipe();
+      try{ navigator.clipboard.writeText('').catch(()=>{}); }catch(e){}
+      showToast('Clipboard wiped','info');
+    }
+  },1000);
+}
+function clearClipboardWipe(){ clearInterval(clipWipeInterval); clipWipeInterval=null; updateClipHint(); }
+function updateClipHint(){
+  const el=$('clipboard-hint'); if(!el) return;
+  if(clipWipeInterval&&clipWipeRemaining>0){
+    el.textContent=`Clipboard wipes in ${clipWipeRemaining}s`;
+    el.style.color=clipWipeRemaining<=10?'var(--danger)':'var(--muted)';
+  } else { el.textContent=''; }
+}
+
+
+function purgeExpiredNotes(){
+  if(!vaultData?.notes) return;
+  const t=Date.now(); const before=vaultData.notes.length;
+  vaultData.notes=vaultData.notes.filter(n=>{ if(!n.expiresAt||t<n.expiresAt)return true; addLog('NOTE_EXPIRED',0); return false; });
+  if(vaultData.notes.length<before){
+    showToast(`${before-vaultData.notes.length} note(s) expired`,'warn');
+    if(currentNoteId&&!vaultData.notes.find(n=>n.id===currentNoteId)){ currentNoteId=null; showEmptyState(); }
+    renderNoteList(); saveVault();
+  }
+}
+
+async function initVault(password){
+  const saltBuf=crypto.getRandomValues(new Uint8Array(16));
+  sessionKey=await deriveKey(password,saltBuf);
+  vaultData={notes:[],logs:[],score:0,_salt:b64e(saltBuf),lastLoginAttempts:0,lastLoginAt:nowISO()};
+  const str=scorePassword(password); const isStrong=str.tier==='STRONG'||str.tier==='GOOD';
+  await addLog('VAULT_CREATED',0);
+  if(isStrong){ adjustScore('STRONG_PASSWORD'); await addLog('STRONG_PASSWORD',SCORE_EVENTS.STRONG_PASSWORD); }
+  else         { adjustScore('WEAK_PASSWORD');   await addLog('WEAK_PASSWORD',SCORE_EVENTS.WEAK_PASSWORD); }
+  await saveVault(); 
+}
+
+
+function loadCachedScore(){ try{ return parseInt(localStorage.getItem('vault_score_cache')||'0'); }catch{ return 0; } }
+function saveCachedScore(s){ try{ localStorage.setItem('vault_score_cache',String(s)); }catch{} }
+
+async function attemptLogin(password){
+ 
+  const raw = await loadBlobVerified();
+  if(!raw) return{ok:false,error:'No vault.'};
+  if(isLocked(raw)) return{ok:false,locked:true,remaining:lockoutRemaining(raw)};
+
+  try{
+    const key=await deriveKey(password,b64d(raw.salt));
+    const data=await decryptVault(raw,key);
+
+    sessionKey=key; vaultData=data; vaultData._salt=raw.salt;
+
+    vaultData.lastLoginAttempts = raw.attempts || 0;
+    vaultData.lastLoginAt       = nowISO();
+
+   
+    raw.attempts=0; raw.lockUntil=null;
+    raw.metaHash = await computeMetaHash(raw.salt, 0, null, raw.lockCount||0);
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(raw));
+
+    
+    if(localStorage.getItem('vault_tamper_flag')){
+      localStorage.removeItem('vault_tamper_flag');
+      await addLog('TAMPER_DETECTED', 0);
+    }
+
+    return{ok:true};
+
+  }catch(e){
+    /*
+     * Note:
+     * The 'attempts', 'lockUntil', and 'lockCount' fields in localStorage
+     * are UNAUTHENTICATED they live outside the AES-GCM ciphertext and
+     * have no built-in integrity protection from the cipher.
+     * LIMITATION: metaHash is a plain SHA-256, not an HMAC. A determined
+     * attacker can recompute it after editing values. Full protection
+     * requires server-side enforcement this is a client best-effort.
+     */
+
+
+    const prev=(raw.attempts==null||raw.attempts===undefined)?MAX_ATTEMPTS-1:raw.attempts;
+    raw.attempts=prev+1;
+
+    
+    if(!vaultData) vaultData={score:loadCachedScore(),logs:[],_salt:raw.salt};
+    adjustScore('AUTH_FAIL');                              
+    await addLog('AUTH_FAIL',SCORE_EVENTS.AUTH_FAIL);     
+    saveCachedScore(vaultData.score);
+    vaultData=null;
+
+    // lockout: BASE × 2^lockCount (10min → 20min → 40min …)
+    if(raw.attempts>=MAX_ATTEMPTS){
+      raw.lockCount=(raw.lockCount||0);
+      raw.lockUntil=Date.now()+BASE_LOCKOUT*Math.pow(2,raw.lockCount);
+      raw.lockCount+=1;
+    }
+
+    
+    raw.metaHash = await computeMetaHash(raw.salt, raw.attempts, raw.lockUntil||null, raw.lockCount||0);
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(raw));
+
+    if(raw.attempts>=MAX_ATTEMPTS)
+      return{ok:false,locked:true,remaining:lockoutRemaining(raw),attempts:raw.attempts};
+    return{ok:false,attempts:raw.attempts};
+  }
+}
+
+
+function createNote(){ const n={id:uuid(),title:'Untitled Note',body:'',createdAt:nowISO(),updatedAt:nowISO(),expiresAt:null}; vaultData.notes.unshift(n); return n; }
+
+async function saveCurrentNote(){
+  const title=$('note-title').value.trim()||'Untitled', body=$('note-body').value, expMin=parseInt($('note-expiry').value);
+  const note=vaultData.notes.find(n=>n.id===currentNoteId); if(!note) return;
+  note.title=title; note.body=body; note.updatedAt=nowISO();
+  note.expiresAt=expMin>0?Date.now()+expMin*60*1000:null;
+  renderNoteList(); await saveVault(); await addLog('NOTE_SAVED',0); showToast('Note encrypted + saved','success');
+}
+
+async function deleteNote(id){
+  vaultData.notes=vaultData.notes.filter(n=>n.id!==id);
+  if(currentNoteId===id){ currentNoteId=null; showEmptyState(); }
+  renderNoteList(); await saveVault(); await addLog('NOTE_DELETED',0); showToast('Note deleted','info');
+}
+
+function loadNote(id){
+  const note=vaultData.notes.find(n=>n.id===id); if(!note) return;
+  currentNoteId=id;
+  $('note-title').value=note.title; $('note-body').value=note.body;
+  if(note.expiresAt){
+    const rem=Math.max(0,Math.round((note.expiresAt-Date.now())/60000));
+    const opts=[0,1,60,1440,10080,43200];
+    $('note-expiry').value=opts.reduce((a,b)=>Math.abs(b-rem)<Math.abs(a-rem)?b:a);
+  }else{ $('note-expiry').value='0'; }
+  $('empty-state').style.display='none'; $('editor-form').style.display='flex';
+  document.querySelectorAll('.note-item').forEach(el=>el.classList.toggle('active',el.dataset.id===id));
+}
+
+function showEmptyState(){ $('empty-state').style.display='flex'; $('editor-form').style.display='none'; }
+
+function renderNoteList(){
+  const list=$('note-list');
+  if(!vaultData?.notes?.length){ list.innerHTML='<div style="padding:14px;font-size:10px;color:var(--muted);text-align:center;">No notes yet.</div>'; $('note-count').textContent='0 notes'; return; }
+  const t=Date.now();
+  list.innerHTML=vaultData.notes.map(n=>{
+    const exp=n.expiresAt; let badge='';
+    if(exp){ const rem=exp-t; if(rem<=0) badge='<span class="exp-badge expired">EXPIRED</span>'; else if(rem<3600000) badge=`<span class="exp-badge soon">~${Math.round(rem/60000)}m</span>`; else badge='<span class="exp-badge ok">exp</span>'; }
+    return `<div class="note-item${n.id===currentNoteId?' active':''}" data-id="${n.id}"><div class="note-item-title">${escHtml(n.title)}</div><div class="note-item-meta"><span>${new Date(n.updatedAt).toLocaleDateString()}</span>${badge}</div></div>`;
+  }).join('');
+  $('note-count').textContent=`${vaultData.notes.length} note${vaultData.notes.length!==1?'s':''}`;
+  list.querySelectorAll('.note-item').forEach(el=>el.addEventListener('click',()=>{ resetIdleTimer(); loadNote(el.dataset.id); }));
+}
+
+function renderVault(){
+  $('score-display').textContent=vaultData.score||0;
+  renderNoteList(); renderLog(); refreshChainStatus(); showEmptyState();
+  purgeExpiredNotes(); setInterval(purgeExpiredNotes,30_000);
+}
+
+function updateLoginUI(){
+  const raw=loadBlob(); const locked=isLocked(raw);
+  
+  const attempts=(raw?.attempts==null)?MAX_ATTEMPTS:raw.attempts;
+  const left=MAX_ATTEMPTS-attempts;
+
+  
+  const tamperFlag=localStorage.getItem('vault_tamper_flag');
+  if(tamperFlag){
+    const msg=$('login-msg');
+    msg.innerHTML='⚠ Metadata tamper detected — vault locked.';
+    msg.className='attempt-info danger';
+  }
+
+  $('lockout-msg').style.display=locked?'block':'none';
+  $('btn-login').disabled=locked; $('login-pw').disabled=locked;
+  if(locked){
+    const rem=lockoutRemaining(raw);
+    $('lockout-countdown').textContent=rem>0?`Unlocks in ${fmtMs(rem)}`:'Lockout expired — refresh.';
+    if(!lockoutTimer){
+      lockoutTimer=setInterval(()=>{
+        const r=lockoutRemaining(loadBlob());
+        $('lockout-countdown').textContent=r>0?`Unlocks in ${fmtMs(r)}`:'';
+        if(r<=0){ clearInterval(lockoutTimer); lockoutTimer=null; updateLoginUI(); }
+      },1000);
+    }
+  }else if(attempts===0&&!tamperFlag){
+    $('login-msg').textContent='Enter your master password'; $('login-msg').className='attempt-info';
+  }else if(!tamperFlag){
+    $('login-msg').innerHTML=`Attempts remaining: <span id="attempts-left">${Math.max(0,left)}</span>`;
+    $('login-msg').className=`attempt-info ${left<=2?'danger':'warn'}`;
+  }
+}
+
+function bootstrap(){ const raw=loadBlob(); if(!raw){ showScreen('screen-setup'); }else{ showScreen('screen-login'); updateLoginUI(); } }
+
+
+$('setup-pw').addEventListener('input',()=>updateStrengthUI($('setup-pw').value));
+
+$('btn-setup').addEventListener('click',async()=>{
+  const pw=$('setup-pw').value, pw2=$('setup-pw2').value, msg=$('setup-msg');
+  if(!pw){ msg.textContent='Password required.'; return; }
+  if(pw!==pw2){ msg.textContent='Passwords do not match.'; const b=document.querySelector('#screen-setup .auth-box'); b.classList.remove('shake'); void b.offsetWidth; b.classList.add('shake'); return; }
+  const str=scorePassword(pw);
+  if(str.tier==='WEAK'||str.tier==='EMPTY'){ msg.textContent='Password too weak. Add length, uppercase, symbols.'; return; }
+  $('btn-setup').disabled=true; $('btn-setup').textContent='Encrypting…';
+  try{ await initVault(pw); showScreen('screen-vault'); resetIdleTimer(); renderVault(); showToast('Vault initialized — AES-256-GCM','success'); }
+  catch(e){ msg.textContent='Error initializing vault.'; console.error(e); }
+  $('btn-setup').disabled=false; $('btn-setup').textContent='Initialize Vault';
+});
+
+$('login-pw').addEventListener('keydown',e=>{ if(e.key==='Enter') $('btn-login').click(); });
+
+$('btn-login').addEventListener('click',async()=>{
+  const pw=$('login-pw').value; if(!pw) return;
+  const raw=loadBlob(); if(isLocked(raw)){ updateLoginUI(); return; }
+  $('btn-login').disabled=true; $('btn-login').textContent='Verifying…';
+
+
+  const att=(raw?.attempts==null)?MAX_ATTEMPTS:(raw.attempts||0);
+  const delay=getDelay(att);
+  if(delay) await new Promise(r=>setTimeout(r,delay));
+
+  const result=await attemptLogin(pw);
+  $('login-pw').value='';
+
+  if(result.ok){
+    
+    await addLog('AUTH_SUCCESS',0);
+    showScreen('screen-vault'); resetIdleTimer(); renderVault(); showToast('Vault unlocked','success');
+  }else{
+    
+    const box=document.querySelector('#screen-login .auth-box');
+    box.classList.remove('shake'); void box.offsetWidth; box.classList.add('shake');
+    if(result.locked){ showToast('Vault locked — too many attempts','error'); }
+    else{ const l=MAX_ATTEMPTS-(result.attempts||0); $('login-msg').innerHTML=`Wrong password. Remaining: <span style="color:var(--danger)">${Math.max(0,l)}</span>`; $('login-msg').className=`attempt-info ${l<=2?'danger':'warn'}`; }
+  }
+  $('btn-login').disabled=false; $('btn-login').textContent='Unlock Vault'; updateLoginUI();
+});
+
+$('btn-reset-vault').addEventListener('click',()=>{
+  showModal('Reset Vault','This permanently deletes all notes, logs, and vault data. Cannot be undone.',()=>{
+    localStorage.removeItem(STORAGE_KEY); localStorage.removeItem('vault_score_cache'); localStorage.removeItem('vault_lockout_log');
+    endSession(); showScreen('screen-setup'); showToast('Vault reset','warn');
+  });
+});
+
+$('btn-logout').addEventListener('click',async()=>{
+  adjustScore('PROPER_LOGOUT'); await addLog('PROPER_LOGOUT',SCORE_EVENTS.PROPER_LOGOUT);
+  await saveVault(); endSession(); $('login-pw').value='';
+  showScreen('screen-login'); updateLoginUI(); showToast('Logged out securely','success');
+});
+
+$('btn-new-note').addEventListener('click',async()=>{ resetIdleTimer(); const n=createNote(); renderNoteList(); loadNote(n.id); $('note-title').focus(); await addLog('NOTE_CREATED',0); });
+
+$('btn-save-note').addEventListener('click',()=>{ resetIdleTimer(); saveCurrentNote(); });
+
+$('btn-delete-note').addEventListener('click',()=>{
+  if(!currentNoteId) return;
+  showModal('Delete Note','This note will be permanently deleted from the vault.',()=>deleteNote(currentNoteId));
+});
+
+
+document.addEventListener('copy',e=>{
+  if(document.activeElement===$('note-body')&&document.getSelection()?.toString())
+    startClipboardWipeTimer();
+});
+
+
+['click','keydown','mousemove','touchstart'].forEach(ev=>{
+  document.addEventListener(ev,()=>{ if($('screen-vault').classList.contains('active')) resetIdleTimer(); },{passive:true});
+});
+
+$('log-toggle').addEventListener('click',()=>$('log-panel').classList.toggle('open'));
+$('log-close').addEventListener('click',()=>$('log-panel').classList.remove('open'));
+$('modal').addEventListener('click',e=>{ if(e.target===$('modal')) $('modal').classList.remove('open'); });
+
+bootstrap();
+</script>
+</body>
+</html>
